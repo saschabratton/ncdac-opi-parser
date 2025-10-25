@@ -714,9 +714,6 @@ mod tests {
             "OFNT3AA1",
             "Offender Profile",
             "https://example.com/OFNT3AA1.zip",
-            None,
-            None,
-            None,
         );
         let result = handler.process_file(&file, None);
 

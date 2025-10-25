@@ -7,7 +7,6 @@ use crate::files::FileMetadata;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -22,15 +21,11 @@ pub const DB_STRUCTURE_PDF_URL: &str = "https://www.doc.state.nc.us/offenders/Pu
 /// * `url` - The URL to download from
 /// * `dest` - The destination file path
 /// * `file_name` - Human-readable file name for progress display
-///
-/// # Returns
-///
-/// The SHA-256 hash of the downloaded file
 pub fn download_file(
     url: &str,
     dest: &Path,
     file_name: &str,
-) -> Result<String> {
+) -> Result<()> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
@@ -58,8 +53,6 @@ pub fn download_file(
     let mut dest_file = File::create(dest)
         .context(format!("Failed to create file: {}", dest.display()))?;
 
-    let mut hasher = Sha256::new();
-
     let mut downloaded = 0u64;
     let mut buffer = vec![0; 8192];
 
@@ -76,17 +69,13 @@ pub fn download_file(
             .write_all(&buffer[..bytes_read])
             .context("Failed to write to file")?;
 
-        hasher.update(&buffer[..bytes_read]);
-
         downloaded += bytes_read as u64;
         pb.set_position(downloaded);
     }
 
     pb.finish_with_message(format!("✓ Downloaded {}", file_name));
 
-    let hash = format!("{:x}", hasher.finalize());
-
-    Ok(hash)
+    Ok(())
 }
 
 /// Download a data file by its metadata.
@@ -97,34 +86,19 @@ pub fn download_file(
 ///
 /// * `file` - The file metadata
 /// * `data_dir` - The data directory path
-///
-/// # Returns
-///
-/// The SHA-256 hash of the downloaded file
-pub fn download_data_file(file: &FileMetadata, data_dir: &Path) -> Result<String> {
+pub fn download_data_file(file: &FileMetadata, data_dir: &Path) -> Result<()> {
     fs::create_dir_all(data_dir)
         .context(format!("Failed to create directory: {}", data_dir.display()))?;
 
     let dest = data_dir.join(format!("{}.zip", file.id));
 
-    let hash = download_file(
+    download_file(
         file.download_url,
         &dest,
         &format!("{} ({})", file.name, file.id),
     )?;
 
-    if let Some(expected_hash) = file.sha256 {
-        if hash != expected_hash {
-            let _ = fs::remove_file(&dest);
-            anyhow::bail!(
-                "Hash mismatch for {}: file may be corrupted or incomplete",
-                file.id
-            );
-        }
-        println!("✓ Hash validated for {}", file.id);
-    }
-
-    Ok(hash)
+    Ok(())
 }
 
 /// Download the database structure PDF.
@@ -147,9 +121,7 @@ pub fn download_db_structure_pdf(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check if a data file exists and is valid.
-///
-/// Validates the file by computing its SHA-256 hash and comparing with expected value.
+/// Check if a data file exists.
 ///
 /// # Arguments
 ///
@@ -158,52 +130,12 @@ pub fn download_db_structure_pdf(data_dir: &Path) -> Result<()> {
 ///
 /// # Returns
 ///
-/// `true` if the file exists and hash matches, `false` otherwise
+/// `true` if the file exists, `false` otherwise
 pub fn is_file_downloaded(file: &FileMetadata, data_dir: &Path) -> bool {
     let path = data_dir.join(format!("{}.zip", file.id));
-
-    if !path.exists() {
-        return false;
-    }
-
-    let Some(expected_hash) = file.sha256 else {
-        return true;
-    };
-
-    match compute_file_hash(&path) {
-        Ok(actual_hash) => {
-            if actual_hash == expected_hash {
-                true
-            } else {
-                eprintln!(
-                    "⚠️  Warning: {} has incorrect hash (file may be corrupted)",
-                    file.id
-                );
-                false
-            }
-        }
-        Err(_) => false,
-    }
+    path.exists()
 }
 
-/// Compute SHA-256 hash of a file.
-fn compute_file_hash(path: &Path) -> Result<String> {
-    use std::io::Read;
-
-    let mut file = File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0; 8192];
-
-    loop {
-        let bytes_read = file.read(&mut buffer)?;
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-    }
-
-    Ok(format!("{:x}", hasher.finalize()))
-}
 
 /// Get the data directory path.
 ///
@@ -235,7 +167,7 @@ pub fn decompressed_files_exist(file: &FileMetadata, data_dir: &Path) -> bool {
 
 /// Check if decompressed files (.des and .dat) are valid.
 ///
-/// Validates both files by computing their SHA-256 hashes and comparing with expected values.
+/// Checks if both .des and .dat files exist.
 ///
 /// # Arguments
 ///
@@ -244,54 +176,9 @@ pub fn decompressed_files_exist(file: &FileMetadata, data_dir: &Path) -> bool {
 ///
 /// # Returns
 ///
-/// `true` if both .des and .dat files exist and hashes match, `false` otherwise
+/// `true` if both .des and .dat files exist, `false` otherwise
 pub fn are_decompressed_files_valid(file: &FileMetadata, data_dir: &Path) -> bool {
-    let file_dir = data_dir.join(file.id);
-    let des_path = file_dir.join(format!("{}.des", file.id));
-    let dat_path = file_dir.join(format!("{}.dat", file.id));
-
-    if !des_path.exists() || !dat_path.exists() {
-        return false;
-    }
-
-    let Some(expected_des_hash) = file.des_sha256 else {
-        return true;
-    };
-    let Some(expected_dat_hash) = file.dat_sha256 else {
-        return true;
-    };
-
-    let des_valid = match compute_file_hash(&des_path) {
-        Ok(actual_hash) => {
-            if actual_hash == expected_des_hash {
-                true
-            } else {
-                eprintln!(
-                    "⚠️  Warning: {}.des has incorrect hash (file may be corrupted)",
-                    file.id
-                );
-                false
-            }
-        }
-        Err(_) => false,
-    };
-
-    let dat_valid = match compute_file_hash(&dat_path) {
-        Ok(actual_hash) => {
-            if actual_hash == expected_dat_hash {
-                true
-            } else {
-                eprintln!(
-                    "⚠️  Warning: {}.dat has incorrect hash (file may be corrupted)",
-                    file.id
-                );
-                false
-            }
-        }
-        Err(_) => false,
-    };
-
-    des_valid && dat_valid
+    decompressed_files_exist(file, data_dir)
 }
 
 /// Check which files are missing from the data directory.
