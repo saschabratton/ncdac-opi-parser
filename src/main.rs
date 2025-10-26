@@ -281,7 +281,7 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
                 .collect();
 
             if !other_incomplete.is_empty() {
-                println!("\n⚠️  The following files are incomplete (incorrect size):");
+                println!("\n⚠️  The following files are out-of-date or incomplete (incorrect size):");
                 for file_id in &other_incomplete {
                     let file = get_file_by_id(file_id).unwrap();
                     println!("   - {} ({})", file.id, file.name);
@@ -309,7 +309,7 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
                         .map(|id| {
                             let file = get_file_by_id(id).unwrap();
                             let status = if file_status.incomplete.contains(id) {
-                                "incomplete"
+                                "out-of-date or incomplete"
                             } else {
                                 "missing"
                             };
@@ -332,7 +332,7 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
                     }
                 }
                 _ => {
-                    println!("\n📥 Downloading all missing/incomplete files...\n");
+                    println!("\n📥 Downloading all missing, incomplete, or out-of-date files...\n");
                     for file_id in &other_problematic {
                         let file = get_file_by_id(file_id).unwrap();
                         download_with_retry(file, &data_dir, false)?;
@@ -408,7 +408,7 @@ async fn run(
         }
         for file_id in &incomplete_files {
             println!(
-                "\x1b[33m⚠\x1b[0m Skipped {} (ZIP file incomplete - incorrect size)",
+                "\x1b[33m⚠\x1b[0m Skipped {} (ZIP file out-of-date or incomplete)",
                 file_id
             );
         }
