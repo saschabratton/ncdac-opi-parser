@@ -31,6 +31,7 @@
 //! # }
 //! ```
 
+use crate::concurrency::{set_pragma_synchronous_full};
 use crate::file_description::FileDescription;
 use crate::files::FileMetadata;
 use crate::parser::DataParser;
@@ -197,14 +198,22 @@ impl DataHandler {
     ///
     /// This method must be called before processing any other files.
     ///
+    /// **Reference File Processing Guarantees:**
+    /// - Uses `PRAGMA synchronous=FULL` for maximum data durability
+    /// - Reference file must complete successfully before any parallel processing begins
+    /// - Returns early with error if reference file processing fails
+    /// - Maintains existing initialization logic from lines 232-252
+    ///
     /// # Arguments
     ///
     /// * `reference_file` - The file to use as the reference table
+    /// * `pb` - Optional progress bar for tracking reference file processing
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - The reference file's schema doesn't contain a recognized primary key field
+    /// - PRAGMA synchronous=FULL cannot be set
     /// - The reference file cannot be processed
     ///
     /// # Example
@@ -221,6 +230,9 @@ impl DataHandler {
     /// # }
     /// ```
     pub fn init(&mut self, reference_file: &FileMetadata, pb: Option<&ProgressBar>) -> Result<ProcessingResults> {
+        set_pragma_synchronous_full(&self.database)
+            .context("Failed to set PRAGMA synchronous=FULL for reference table processing")?;
+
         let reference_table_name = to_snake_case(reference_file.name);
         let reference_description = FileDescription::new(reference_file.id)?;
 
@@ -239,7 +251,7 @@ impl DataHandler {
 
         let results = self.process_file(reference_file, pb)?;
 
-        results.ok_or_else(|| anyhow!("Failed to process reference file"))
+        results.ok_or_else(|| anyhow!("Failed to process reference file: reference file processing must complete successfully before continuing"))
     }
 
     /// Creates a table for the specified file.
@@ -600,6 +612,71 @@ impl DataHandler {
     pub fn processed_files(&self) -> &HashSet<String> {
         &self.processed_files
     }
+
+    /// Returns a reference to the underlying SQLite connection.
+    ///
+    /// This is primarily used for PRAGMA configuration in concurrent processing scenarios.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use ncdac_opi_parser::data_handler::DataHandler;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let handler = DataHandler::new("database.db")?;
+    /// let conn = handler.connection();
+    /// // Configure PRAGMA settings on the connection
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn connection(&self) -> &Connection {
+        &self.database
+    }
+
+    /// Initializes this handler with reference metadata from another handler.
+    ///
+    /// This is used to set up worker handlers in parallel processing scenarios.
+    /// Each worker needs to know about the reference table to properly create
+    /// foreign key constraints.
+    ///
+    /// # Arguments
+    ///
+    /// * `reference_file` - The reference file metadata
+    /// * `reference_table_name` - The name of the reference table
+    /// * `reference_field` - The primary key field name of the reference table
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use ncdac_opi_parser::data_handler::DataHandler;
+    /// use ncdac_opi_parser::files::get_file_by_id;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let main_handler = DataHandler::new("database.db")?;
+    /// let mut worker_handler = DataHandler::new("database.db")?;
+    ///
+    /// // Copy reference metadata from main handler to worker
+    /// if let (Some(ref_file), Some(ref_table), Some(ref_field)) = (
+    ///     main_handler.reference_file(),
+    ///     main_handler.reference_table_name(),
+    ///     main_handler.reference_field()
+    /// ) {
+    ///     worker_handler.init_from_reference(ref_file, ref_table, ref_field);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn init_from_reference(
+        &mut self,
+        reference_file: &FileMetadata,
+        reference_table_name: &str,
+        reference_field: &str,
+    ) {
+        self.reference_file = Some(*reference_file);
+        self.reference_table_name = Some(reference_table_name.to_string());
+        self.reference_field = Some(reference_field.to_string());
+        self.is_initialized = true;
+    }
 }
 
 /// Maps a DES field type to a SQLite type.
@@ -722,6 +799,474 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not initialized"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reference_file_sets_synchronous_full() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut handler = DataHandler::new(path)?;
+
+        let reference_file = FileMetadata::new(
+            "OFNT3AA1",
+            "Offender Profile",
+            "https://example.com/OFNT3AA1.zip",
+            None,
+            None,
+            None,
+        );
+
+        let _ = handler.init(&reference_file, None);
+
+        let sync_mode: i32 = handler
+            .database
+            .pragma_query_value(None, "synchronous", |row| row.get(0))?;
+
+        assert_eq!(sync_mode, 2, "Reference table should use PRAGMA synchronous=FULL");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reference_file_initialization_state() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut handler = DataHandler::new(path)?;
+
+        assert!(!handler.is_initialized(), "Handler should not be initialized before init()");
+        assert!(handler.reference_file().is_none());
+        assert!(handler.reference_table_name().is_none());
+        assert!(handler.reference_field().is_none());
+
+        let reference_file = FileMetadata::new(
+            "OFNT3AA1",
+            "Offender Profile",
+            "https://example.com/OFNT3AA1.zip",
+            None,
+            None,
+            None,
+        );
+
+        let _ = handler.init(&reference_file, None);
+
+        assert!(handler.is_initialized(), "Handler should be marked as initialized after init() call");
+        assert!(handler.reference_file().is_some());
+        assert!(handler.reference_table_name().is_some());
+        assert!(handler.reference_field().is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reference_file_must_complete_before_other_processing() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut handler = DataHandler::new(path)?;
+
+        let other_file = FileMetadata::new(
+            "OFNT1BA1",
+            "Offender Address",
+            "https://example.com/OFNT1BA1.zip",
+            None,
+            None,
+            None,
+        );
+
+        let result = handler.process_file(&other_file, None);
+
+        assert!(result.is_err(), "process_file() should fail if handler not initialized");
+        assert!(result.unwrap_err().to_string().contains("not initialized"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_reference_file_pragma_persists() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut handler = DataHandler::new(path)?;
+
+        let sync_mode_before: i32 = handler
+            .database
+            .pragma_query_value(None, "synchronous", |row| row.get(0))?;
+
+        let reference_file = FileMetadata::new(
+            "OFNT3AA1",
+            "Offender Profile",
+            "https://example.com/OFNT3AA1.zip",
+            None,
+            None,
+            None,
+        );
+
+        let _ = handler.init(&reference_file, None);
+
+        let sync_mode_after: i32 = handler
+            .database
+            .pragma_query_value(None, "synchronous", |row| row.get(0))?;
+
+        assert_eq!(sync_mode_after, 2, "PRAGMA synchronous should be FULL after init()");
+
+        if sync_mode_before != 2 {
+            assert_ne!(sync_mode_before, sync_mode_after, "PRAGMA should have changed");
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_data_handler_connection_accessor() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let handler = DataHandler::new(path)?;
+
+        let conn = handler.connection();
+
+        let fk_enabled: i32 = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        assert_eq!(fk_enabled, 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_multiple_workers_concurrent_table_creation() -> Result<()> {
+        use crate::concurrency::create_worker_handler;
+        use std::sync::Arc;
+        use std::thread;
+
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+        let db_path = Arc::new(path.to_string());
+
+        let mut main_handler = DataHandler::new(path)?;
+        let reference_file = FileMetadata::new(
+            "OFNT3AA1",
+            "Offender Profile",
+            "https://example.com/OFNT3AA1.zip",
+            None,
+            None,
+            None,
+        );
+
+        main_handler.reference_file = Some(reference_file);
+        main_handler.reference_table_name = Some("offender_profile".to_string());
+        main_handler.reference_field = Some("DOCNUM".to_string());
+        main_handler.is_initialized = true;
+
+        main_handler.database.execute(
+            "CREATE TABLE offender_profile (DOCNUM TEXT PRIMARY KEY)",
+            [],
+        )?;
+
+        let ref_table = main_handler.reference_table_name().unwrap().to_string();
+        let ref_field = main_handler.reference_field().unwrap().to_string();
+
+        let mut handles = vec![];
+        for _ in 0..3 {
+            let db = Arc::clone(&db_path);
+            let ref_file = reference_file;
+            let ref_tbl = ref_table.clone();
+            let ref_fld = ref_field.clone();
+
+            let handle = thread::spawn(move || -> Result<()> {
+                let mut worker = create_worker_handler(&db)?;
+                worker.init_from_reference(&ref_file, &ref_tbl, &ref_fld);
+
+                let test_file = FileMetadata::new(
+                    "OFNT1BA1",
+                    "Offender Address",
+                    "https://example.com/OFNT1BA1.zip",
+                    None,
+                    None,
+                    None,
+                );
+
+                worker.create_table_for_file(&test_file)?;
+                Ok(())
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Thread panicked")?;
+        }
+
+        let table_exists: i32 = main_handler.database.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='offender_address'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(table_exists, 1, "Table should exist after concurrent creation attempts");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_error_collection_does_not_stop_processing() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut handler = DataHandler::new(path)?;
+
+        handler.database.execute(
+            "CREATE TABLE reference_table (id TEXT PRIMARY KEY)",
+            [],
+        )?;
+
+        handler.database.execute(
+            "INSERT INTO reference_table (id) VALUES ('VALID_ID')",
+            [],
+        )?;
+
+        handler.database.execute(
+            "CREATE TABLE dependent_table (id TEXT, ref_id TEXT, FOREIGN KEY (ref_id) REFERENCES reference_table(id))",
+            [],
+        )?;
+
+        handler.is_initialized = true;
+        handler.reference_table_name = Some("reference_table".to_string());
+        handler.reference_field = Some("id".to_string());
+
+        let test_file = FileMetadata::new(
+            "TEST",
+            "Test Table",
+            "https://example.com/TEST.zip",
+            None,
+            None,
+            None,
+        );
+
+        let batch = vec![
+            (vec![Some("1".to_string()), Some("VALID_ID".to_string())], 1),
+            (vec![Some("2".to_string()), Some("INVALID_ID".to_string())], 2),
+            (vec![Some("3".to_string()), Some("VALID_ID".to_string())], 3),
+        ];
+
+        let insert_sql = "INSERT INTO dependent_table (id, ref_id) VALUES (?, ?)";
+        let errors = handler.commit_batch(&insert_sql, &batch, &test_file, "dependent_table")?;
+
+        assert_eq!(errors.len(), 1, "Should collect FK violation error");
+        assert_eq!(errors[0].file_id, "TEST");
+
+        let count: i32 = handler.database.query_row(
+            "SELECT COUNT(*) FROM dependent_table",
+            [],
+            |row| row.get(0),
+        )?;
+
+        assert_eq!(count, 2, "Should have inserted 2 valid records despite 1 FK violation");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_init_from_reference_preserves_metadata() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut worker_handler = DataHandler::new(path)?;
+
+        let reference_file = FileMetadata::new(
+            "OFNT3AA1",
+            "Offender Profile",
+            "https://example.com/OFNT3AA1.zip",
+            None,
+            None,
+            None,
+        );
+
+        worker_handler.init_from_reference(&reference_file, "offender_profile", "DOCNUM");
+
+        assert!(worker_handler.is_initialized(), "Worker should be marked as initialized");
+        assert_eq!(worker_handler.reference_file().unwrap().id, "OFNT3AA1");
+        assert_eq!(worker_handler.reference_table_name().unwrap(), "offender_profile");
+        assert_eq!(worker_handler.reference_field().unwrap(), "DOCNUM");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_error_aggregation_maintains_all_errors() -> Result<()> {
+        use crate::concurrency::ErrorAggregator;
+        use std::sync::Arc;
+        use std::thread;
+
+        let aggregator = Arc::new(ErrorAggregator::new());
+        let mut handles = vec![];
+
+        for worker_id in 0..4 {
+            let agg = Arc::clone(&aggregator);
+            let handle = thread::spawn(move || {
+                for error_id in 0..(worker_id + 1) * 2 {
+                    let error = ErrorDetails::new(
+                        format!("FILE_W{}", worker_id),
+                        format!("table_{}", worker_id),
+                        format!("Error {} from worker {}", error_id, worker_id),
+                        "SQLite FK error".to_string(),
+                    );
+                    agg.add_error(error);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("Worker thread panicked");
+        }
+
+        let all_errors = aggregator.get_errors();
+        assert_eq!(all_errors.len(), 20, "Should collect all errors from all workers");
+
+        let w0_errors: Vec<_> = all_errors.iter().filter(|e| e.file_id == "FILE_W0").collect();
+        let w1_errors: Vec<_> = all_errors.iter().filter(|e| e.file_id == "FILE_W1").collect();
+        let w2_errors: Vec<_> = all_errors.iter().filter(|e| e.file_id == "FILE_W2").collect();
+        let w3_errors: Vec<_> = all_errors.iter().filter(|e| e.file_id == "FILE_W3").collect();
+
+        assert_eq!(w0_errors.len(), 2);
+        assert_eq!(w1_errors.len(), 4);
+        assert_eq!(w2_errors.len(), 6);
+        assert_eq!(w3_errors.len(), 8);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_database_connection_cleanup() -> Result<()> {
+        use crate::concurrency::create_worker_handler;
+
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        for _ in 0..5 {
+            let handler = create_worker_handler(path)?;
+            let _: i32 = handler.connection().pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_batch_size_constant_unchanged() {
+        assert_eq!(BATCH_SIZE, 250, "BATCH_SIZE must remain 250 (optimized value)");
+    }
+
+    #[test]
+    fn test_foreign_key_enforcement_across_connections() -> Result<()> {
+        use crate::concurrency::create_worker_handler;
+
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut main_handler = DataHandler::new(path)?;
+        main_handler.database.execute(
+            "CREATE TABLE ref_table (id TEXT PRIMARY KEY)",
+            [],
+        )?;
+        main_handler.database.execute(
+            "INSERT INTO ref_table (id) VALUES ('VALID')",
+            [],
+        )?;
+
+        let worker = create_worker_handler(path)?;
+
+        let fk_enabled: i32 = worker.connection()
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        assert_eq!(fk_enabled, 1, "Worker connection must have FK enforcement enabled");
+
+        worker.connection().execute(
+            "CREATE TABLE dep_table (id TEXT, ref_id TEXT, FOREIGN KEY (ref_id) REFERENCES ref_table(id))",
+            [],
+        )?;
+
+        let result = worker.connection().execute(
+            "INSERT INTO dep_table (id, ref_id) VALUES ('1', 'INVALID')",
+            [],
+        );
+
+        assert!(result.is_err(), "FK violation should be detected on worker connection");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_processed_files_tracking_prevents_reprocessing() -> Result<()> {
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut handler = DataHandler::new(path)?;
+
+        handler.is_initialized = true;
+        handler.reference_table_name = Some("ref_table".to_string());
+        handler.reference_field = Some("id".to_string());
+
+        handler.database.execute(
+            "CREATE TABLE test_table (id TEXT PRIMARY KEY)",
+            [],
+        )?;
+
+        let test_file = FileMetadata::new(
+            "TEST",
+            "Test Table",
+            "https://example.com/TEST.zip",
+            None,
+            None,
+            None,
+        );
+
+        handler.processed_files.insert("TEST".to_string());
+
+        let result = handler.process_file(&test_file, None)?;
+
+        assert!(result.is_none(), "Should skip already processed files");
+        assert_eq!(handler.processed_files.len(), 1, "Should still have 1 processed file");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_worker_handlers_maintain_isolation() -> Result<()> {
+        use crate::concurrency::create_worker_handler;
+
+        let temp_file = NamedTempFile::new()?;
+        let path = temp_file.path().to_str().unwrap();
+
+        let mut worker1 = create_worker_handler(path)?;
+        let mut worker2 = create_worker_handler(path)?;
+
+        let ref_file = FileMetadata::new(
+            "OFNT3AA1",
+            "Offender Profile",
+            "https://example.com/OFNT3AA1.zip",
+            None,
+            None,
+            None,
+        );
+
+        worker1.init_from_reference(&ref_file, "offender_profile", "DOCNUM");
+        worker2.init_from_reference(&ref_file, "offender_profile", "DOCNUM");
+
+        worker1.errors.push(ErrorDetails::new(
+            "FILE1".to_string(),
+            "table1".to_string(),
+            "Error 1".to_string(),
+            "SQLite error".to_string(),
+        ));
+
+        assert_eq!(worker1.errors.len(), 1, "Worker 1 should have 1 error");
+        assert_eq!(worker2.errors.len(), 0, "Worker 2 should have 0 errors (isolated)");
+
+        worker1.processed_files.insert("FILE1".to_string());
+
+        assert_eq!(worker1.processed_files.len(), 1, "Worker 1 should track 1 processed file");
+        assert_eq!(worker2.processed_files.len(), 0, "Worker 2 should track 0 processed files (isolated)");
 
         Ok(())
     }

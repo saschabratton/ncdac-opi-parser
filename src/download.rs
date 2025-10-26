@@ -290,7 +290,7 @@ pub fn decompressed_files_exist(file: &FileMetadata, data_dir: &Path) -> bool {
 /// # Returns
 ///
 /// `true` if both .des and .dat files exist and have correct sizes, `false` otherwise
-pub fn  (file: &FileMetadata, data_dir: &Path) -> bool {
+pub fn are_decompressed_files_valid(file: &FileMetadata, data_dir: &Path) -> bool {
     if !decompressed_files_exist(file, data_dir) {
         return false;
     }

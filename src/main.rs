@@ -8,6 +8,7 @@ use clap::Parser;
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use ncdac_opi_parser::{
+    concurrency::{create_worker_handler, ErrorAggregator},
     data_handler::DataHandler,
     download::{
         are_decompressed_files_valid, categorize_files, download_data_file, get_data_dir,
@@ -17,8 +18,10 @@ use ncdac_opi_parser::{
     unzip::unzip_data_file,
     utilities::{count_lines, delete_data_subdirectory, format_count, format_duration},
 };
+use rayon::prelude::*;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// NC DAC Offender Public Information Parser
@@ -474,7 +477,13 @@ async fn run(
             .unwrap()
             .progress_chars("#>-"),
     );
-    ref_pb.set_message(format!("Inserting {} records into {} reference table", format_count(ref_line_count as usize), reference_file.name));
+    // Task 2.4: Clear progress indication for reference file
+    ref_pb.set_message(format!(
+        "Processing reference file ({}) - Inserting {} records into {} table",
+        reference_file.id,
+        format_count(ref_line_count as usize),
+        reference_file.name
+    ));
 
     let init_results = data_handler
         .init(reference_file, Some(&ref_pb))
@@ -486,71 +495,146 @@ async fn run(
     if !init_results.errors.is_empty() {
         ref_pb.finish_and_clear();
         println!(
-            "⚠️  {} errors encountered while processing {}.",
+            "⚠️  {} errors encountered while processing {} reference file.",
             init_results.errors.len(),
             reference_file.name
         );
     } else {
         ref_pb.finish_with_message(format!(
-            "✓ Inserted {} records into {} reference table in {}",
+            "✓ Processed reference file ({}) - Inserted {} records into {} table in {}",
+            reference_file.id,
             format_count(init_results.processed),
             reference_file.name,
             init_duration
         ));
     }
 
-    for file in &FILES {
-        if file.id == reference_file.id {
-            continue;
-        }
+    // Task 3.8: Log processing phase transition
+    println!("\n📋 Reference file processing complete");
 
-        let file_dir = data_dir.join(file.id);
-        if !file_dir.exists() {
-            continue;
-        }
-
-        let start_time = SystemTime::now();
-
-        let dat_path = file_dir.join(format!("{}.dat", file.id));
-        let line_count = count_lines(&dat_path)
-            .with_context(|| format!("Failed to count lines in {}", dat_path.display()))?;
-
-        let pb = ProgressBar::new(line_count);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} records ({eta})")
-                .unwrap()
-                .progress_chars("#>-"),
-        );
-        pb.set_message(format!("Inserting {} records into {} table", format_count(line_count as usize), file.name));
-
-        let results = data_handler
-            .process_file(file, Some(&pb))
-            .with_context(|| format!("Failed to process file {}", file.id))?;
-
-        if let Some(results) = results {
-            let duration = format_duration(start_time, None)
-                .context("Failed to calculate processing duration")?;
-
-            if !results.errors.is_empty() {
-                pb.finish_and_clear();
-                println!(
-                    "⚠️  {} errors encountered while processing {}.",
-                    results.errors.len(),
-                    file.name
-                );
-            } else {
-                pb.finish_with_message(format!(
-                    "✓ Inserted {} records into {} table in {}",
-                    format_count(results.processed),
-                    file.name,
-                    duration
-                ));
+    // Task 3.3: Calculate total record count for combined progress bar
+    // Filter files to process in parallel (exclude reference file and missing files)
+    let files_to_process: Vec<_> = FILES
+        .iter()
+        .filter(|file| {
+            if file.id == reference_file.id {
+                return false;
             }
-        } else {
-            pb.finish_and_clear();
+            let file_dir = data_dir.join(file.id);
+            file_dir.exists()
+        })
+        .collect();
+
+    if files_to_process.is_empty() {
+        // No additional files to process
+        if !args.keep_data {
+            let spinner = create_spinner("Cleaning up data files...");
+            for file in &FILES {
+                delete_data_subdirectory(file.id)
+                    .await
+                    .with_context(|| format!("Failed to delete data directory for {}", file.id))?;
+            }
+            spinner.finish_with_message("Cleaned up data files".to_string());
+        }
+        return Ok(data_handler);
+    }
+
+    // Count total records across all files to process
+    let mut total_records = 0u64;
+    for file in &files_to_process {
+        let dat_path = data_dir.join(file.id).join(format!("{}.dat", file.id));
+        if let Ok(line_count) = count_lines(&dat_path) {
+            total_records += line_count;
         }
     }
+
+    // Task 3.8: Log processing phase transition
+    println!("🚀 Starting parallel processing of {} files", files_to_process.len());
+
+    // Task 3.4: Create shared progress bar with Arc wrapping
+    let combined_pb = Arc::new(ProgressBar::new(total_records));
+    combined_pb.set_style(
+        ProgressStyle::default_bar()
+            .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} records ({eta})")
+            .unwrap()
+            .progress_chars("#>-"),
+    );
+    combined_pb.set_message(format!(
+        "Processing {} files concurrently - {} total records",
+        files_to_process.len(),
+        format_count(total_records as usize)
+    ));
+
+    // Task 3.7: Aggregate errors from all parallel workers
+    let error_aggregator = Arc::new(ErrorAggregator::new());
+
+    let database_path = args.output.to_str().context("Invalid output path")?;
+    let parallel_start_time = SystemTime::now();
+
+    // Extract reference metadata before parallel processing
+    // (data_handler cannot be borrowed across threads)
+    let ref_file = data_handler.reference_file().copied()
+        .context("Reference file not set before parallel processing")?;
+    let ref_table = data_handler.reference_table_name()
+        .context("Reference table not set before parallel processing")?
+        .to_string();
+    let ref_field = data_handler.reference_field()
+        .context("Reference field not set before parallel processing")?
+        .to_string();
+
+    // Task 3.5: Convert sequential file loop to Rayon parallel iterator
+    // Task 3.6: Implement per-thread file processing with error collection
+    files_to_process.par_iter().for_each(|file| {
+        // Task 3.2: Each thread creates its own DataHandler instance with separate connection
+        let mut worker_handler = match create_worker_handler(database_path) {
+            Ok(handler) => handler,
+            Err(e) => {
+                eprintln!("❌ Failed to create worker handler for {}: {:#}", file.id, e);
+                return;
+            }
+        };
+
+        // Initialize the worker handler with the same reference file metadata
+        // This sets up the reference table name and field for foreign key constraints
+        worker_handler.init_from_reference(&ref_file, &ref_table, &ref_field);
+
+        // Clone the progress bar for this thread
+        let pb = Arc::clone(&combined_pb);
+        let agg = Arc::clone(&error_aggregator);
+
+        // Process the file with the worker's own connection
+        match worker_handler.process_file(file, Some(&pb)) {
+            Ok(Some(results)) => {
+                // Collect errors from this file into the shared aggregator
+                if !results.errors.is_empty() {
+                    agg.add_errors(results.errors);
+                }
+            }
+            Ok(None) => {
+                // File was already processed (shouldn't happen in parallel context)
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to process file {}: {:#}", file.id, e);
+            }
+        }
+    });
+
+    let parallel_duration = format_duration(parallel_start_time, None)
+        .context("Failed to calculate parallel processing duration")?;
+
+    combined_pb.finish_with_message(format!(
+        "✓ Processed {} files concurrently in {} - {} total records",
+        files_to_process.len(),
+        parallel_duration,
+        format_count(total_records as usize)
+    ));
+
+    // Task 3.8: Log processing phase transition
+    println!("✅ Parallel processing complete");
+
+    // Task 3.7: Merge errors from parallel workers into main data handler
+    let all_parallel_errors = error_aggregator.get_errors();
+    data_handler.errors.extend(all_parallel_errors);
 
     if !args.keep_data {
         let spinner = create_spinner("Cleaning up data files...");
