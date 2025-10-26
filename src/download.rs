@@ -121,7 +121,41 @@ pub fn download_db_structure_pdf(data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check if a data file exists.
+/// Get the expected file size from the remote server using HTTP HEAD request.
+///
+/// # Arguments
+///
+/// * `url` - The URL to check
+///
+/// # Returns
+///
+/// The expected file size in bytes, or None if it cannot be determined
+fn get_remote_file_size(url: &str) -> Option<u64> {
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+
+    let response = client.head(url).send().ok()?;
+
+    response.content_length()
+}
+
+/// File download status
+#[derive(Debug, PartialEq)]
+pub enum FileStatus {
+    /// File exists and has correct size
+    Complete,
+    /// File exists but has incorrect size
+    Incomplete,
+    /// File does not exist
+    Missing,
+}
+
+/// Check the download status of a data file.
+///
+/// This performs a quick HTTP HEAD request to verify the local file size
+/// matches the expected size from the server without re-downloading.
 ///
 /// # Arguments
 ///
@@ -130,10 +164,50 @@ pub fn download_db_structure_pdf(data_dir: &Path) -> Result<()> {
 ///
 /// # Returns
 ///
-/// `true` if the file exists, `false` otherwise
-pub fn is_file_downloaded(file: &FileMetadata, data_dir: &Path) -> bool {
+/// The file's download status
+pub fn get_file_status(file: &FileMetadata, data_dir: &Path) -> FileStatus {
     let path = data_dir.join(format!("{}.zip", file.id));
-    path.exists()
+
+    if !path.exists() {
+        return FileStatus::Missing;
+    }
+
+    let local_size = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return FileStatus::Missing,
+    };
+
+    match get_remote_file_size(file.download_url) {
+        Some(expected_size) => {
+            if local_size == expected_size {
+                FileStatus::Complete
+            } else {
+                FileStatus::Incomplete
+            }
+        }
+        None => {
+            // If we can't get the remote size, assume the file is valid
+            // This provides a fallback in case of network issues
+            FileStatus::Complete
+        }
+    }
+}
+
+/// Check if a data file exists and has the correct size.
+///
+/// This performs a quick HTTP HEAD request to verify the local file size
+/// matches the expected size from the server without re-downloading.
+///
+/// # Arguments
+///
+/// * `file` - The file metadata
+/// * `data_dir` - The data directory path
+///
+/// # Returns
+///
+/// `true` if the file exists and has the correct size, `false` otherwise
+pub fn is_file_downloaded(file: &FileMetadata, data_dir: &Path) -> bool {
+    get_file_status(file, data_dir) == FileStatus::Complete
 }
 
 
@@ -181,11 +255,59 @@ pub fn are_decompressed_files_valid(file: &FileMetadata, data_dir: &Path) -> boo
     decompressed_files_exist(file, data_dir)
 }
 
+/// Categorization of files by their download status
+#[derive(Debug, Default)]
+pub struct FilesStatus {
+    /// Files that don't exist at all
+    pub missing: Vec<String>,
+    /// Files that exist but have incorrect size
+    pub incomplete: Vec<String>,
+}
+
+/// Categorize files by their download status.
+///
+/// Checks in this order:
+/// 1. If decompressed files (.des and .dat) exist, file is considered available
+/// 2. If ZIP file exists and has correct size, file is considered available
+/// 3. If ZIP file exists but has wrong size, file is considered incomplete
+/// 4. Otherwise, file is considered missing
+///
+/// # Arguments
+///
+/// * `files` - Array of file metadata to check
+/// * `data_dir` - The data directory path
+///
+/// # Returns
+///
+/// `FilesStatus` containing vectors of missing and incomplete file IDs
+pub fn categorize_files(files: &[FileMetadata], data_dir: &Path) -> FilesStatus {
+    let mut status = FilesStatus::default();
+
+    for file in files {
+        if decompressed_files_exist(file, data_dir) {
+            continue;
+        }
+
+        match get_file_status(file, data_dir) {
+            FileStatus::Complete => {
+            }
+            FileStatus::Incomplete => {
+                status.incomplete.push(file.id.to_string());
+            }
+            FileStatus::Missing => {
+                status.missing.push(file.id.to_string());
+            }
+        }
+    }
+
+    status
+}
+
 /// Check which files are missing from the data directory.
 ///
 /// Checks in this order:
 /// 1. If decompressed files (.des and .dat) exist, file is considered available
-/// 2. If ZIP file exists and has valid hash, file is considered available
+/// 2. If ZIP file exists and has valid size, file is considered available
 /// 3. Otherwise, file is considered missing
 ///
 /// # Arguments
@@ -197,17 +319,10 @@ pub fn are_decompressed_files_valid(file: &FileMetadata, data_dir: &Path) -> boo
 ///
 /// Vector of file IDs that are missing (neither decompressed files nor valid ZIP exists)
 pub fn get_missing_files(files: &[FileMetadata], data_dir: &Path) -> Vec<String> {
-    files
-        .iter()
-        .filter(|file| {
-            if decompressed_files_exist(file, data_dir) {
-                return false;
-            }
-
-            !is_file_downloaded(file, data_dir)
-        })
-        .map(|file| file.id.to_string())
-        .collect()
+    let status = categorize_files(files, data_dir);
+    let mut all_missing = status.missing;
+    all_missing.extend(status.incomplete);
+    all_missing
 }
 
 #[cfg(test)]

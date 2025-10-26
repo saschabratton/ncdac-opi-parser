@@ -9,7 +9,7 @@ use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use ncdac_opi_parser::{
     data_handler::DataHandler,
-    download::{download_data_file, get_data_dir, get_missing_files},
+    download::{categorize_files, download_data_file, get_data_dir, get_file_status, FileStatus},
     files::{get_file_by_id, FILES},
     unzip::unzip_data_file,
     utilities::{count_lines, delete_data_subdirectory, format_count, format_duration},
@@ -223,11 +223,14 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
     let data_dir = get_data_dir();
 
     let spinner = create_spinner("Checking for available data files...");
-    let missing = get_missing_files(&FILES, &data_dir);
+    let file_status = categorize_files(&FILES, &data_dir);
     spinner.finish_and_clear();
 
-    if !missing.is_empty() {
-        let reference_missing = missing.contains(&reference_file.id.to_string());
+    let mut all_problematic: Vec<String> = file_status.missing.clone();
+    all_problematic.extend(file_status.incomplete.clone());
+
+    if !all_problematic.is_empty() {
+        let reference_missing = all_problematic.contains(&reference_file.id.to_string());
 
         if reference_missing {
             println!("⚠️  Reference file {} ({}) is required but not found.", reference_file.id, reference_file.name);
@@ -253,16 +256,36 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
             }
         }
 
-        let other_missing: Vec<_> = missing
+        let other_problematic: Vec<_> = all_problematic
             .iter()
             .filter(|id| id.as_str() != reference_file.id)
             .collect();
 
-        if !other_missing.is_empty() {
-            println!("\n📋 The following optional files are missing:");
-            for file_id in &other_missing {
-                let file = get_file_by_id(file_id).unwrap();
-                println!("   - {} ({})", file.id, file.name);
+        if !other_problematic.is_empty() {
+            let other_missing: Vec<_> = file_status.missing
+                .iter()
+                .filter(|id| id.as_str() != reference_file.id)
+                .collect();
+
+            if !other_missing.is_empty() {
+                println!("\n📋 The following optional files are missing:");
+                for file_id in &other_missing {
+                    let file = get_file_by_id(file_id).unwrap();
+                    println!("   - {} ({})", file.id, file.name);
+                }
+            }
+
+            let other_incomplete: Vec<_> = file_status.incomplete
+                .iter()
+                .filter(|id| id.as_str() != reference_file.id)
+                .collect();
+
+            if !other_incomplete.is_empty() {
+                println!("\n⚠️  The following files are incomplete (incorrect size):");
+                for file_id in &other_incomplete {
+                    let file = get_file_by_id(file_id).unwrap();
+                    println!("   - {} ({})", file.id, file.name);
+                }
             }
 
             println!("\nWould you like to download them?");
@@ -281,11 +304,16 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
                     println!("Skipping optional file downloads.");
                 }
                 "c" => {
-                    let options: Vec<String> = other_missing
+                    let options: Vec<String> = other_problematic
                         .iter()
                         .map(|id| {
                             let file = get_file_by_id(id).unwrap();
-                            format!("{} ({})", file.id, file.name)
+                            let status = if file_status.incomplete.contains(id) {
+                                "incomplete"
+                            } else {
+                                "missing"
+                            };
+                            format!("{} ({}) [{}]", file.id, file.name, status)
                         })
                         .collect();
 
@@ -297,15 +325,15 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
                     if !selections.is_empty() {
                         println!("\n📥 Downloading selected files...\n");
                         for idx in selections {
-                            let file_id = other_missing[idx].as_str();
+                            let file_id = other_problematic[idx].as_str();
                             let file = get_file_by_id(file_id).unwrap();
                             download_with_retry(file, &data_dir, false)?;
                         }
                     }
                 }
                 _ => {
-                    println!("\n📥 Downloading all missing files...\n");
-                    for file_id in &other_missing {
+                    println!("\n📥 Downloading all missing/incomplete files...\n");
+                    for file_id in &other_problematic {
                         let file = get_file_by_id(file_id).unwrap();
                         download_with_retry(file, &data_dir, false)?;
                     }
@@ -329,6 +357,7 @@ async fn run(
     let mut decompress_count = 0;
     let mut already_decompressed = Vec::new();
     let mut missing_files = Vec::new();
+    let mut incomplete_files = Vec::new();
 
     let data_dir = get_data_dir();
 
@@ -338,10 +367,18 @@ async fn run(
             continue;
         }
 
-        let zip_path = data_dir.join(format!("{}.zip", file.id));
-        if !zip_path.exists() {
-            missing_files.push(file.id);
-            continue;
+        match get_file_status(file, &data_dir) {
+            FileStatus::Missing => {
+                missing_files.push(file.id);
+                continue;
+            }
+            FileStatus::Incomplete => {
+                incomplete_files.push(file.id);
+                continue;
+            }
+            FileStatus::Complete => {
+                // File is valid, proceed to decompress
+            }
         }
 
         if decompress_count == 0 {
@@ -359,13 +396,19 @@ async fn run(
         }
     }
 
-    if !missing_files.is_empty() {
+    if !missing_files.is_empty() || !incomplete_files.is_empty() {
         if decompress_count == 0 {
             spinner.finish_and_clear();
         }
         for file_id in &missing_files {
             println!(
                 "\x1b[34mℹ\x1b[0m Skipped {} (ZIP file not available)",
+                file_id
+            );
+        }
+        for file_id in &incomplete_files {
+            println!(
+                "\x1b[33m⚠\x1b[0m Skipped {} (ZIP file incomplete - incorrect size)",
                 file_id
             );
         }
