@@ -144,6 +144,10 @@ async fn main() -> Result<()> {
         .context("Failed to calculate total duration")?;
     println!("✅ Processing complete in {}", total_duration);
 
+    if let Some(missing_des_report) = data_handler.report_missing_des_files() {
+        eprintln!("\n{}", missing_des_report);
+    }
+
     if !data_handler.errors.is_empty() {
         print!(
             "\n⚠️  {} errors encountered while processing. View them? (y/N): ",
