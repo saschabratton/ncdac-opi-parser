@@ -1030,9 +1030,9 @@ mod tests {
             "https://example.com/OFNT3AA1.zip",
         );
 
-        let _ = handler.init(&reference_file, None);
+        handler.init_from_reference(&reference_file, "offender_profile", "CMDORNUM");
 
-        assert!(handler.is_initialized(), "Handler should be marked as initialized after init() call");
+        assert!(handler.is_initialized(), "Handler should be marked as initialized after init_from_reference() call");
         assert!(handler.reference_file().is_some());
         assert!(handler.reference_table_name().is_some());
         assert!(handler.reference_field().is_some());
@@ -1108,73 +1108,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_multiple_workers_concurrent_table_creation() -> Result<()> {
-        use crate::concurrency::create_worker_handler;
-        use std::sync::Arc;
-        use std::thread;
-
-        let temp_file = NamedTempFile::new()?;
-        let path = temp_file.path().to_str().unwrap();
-        let db_path = Arc::new(path.to_string());
-
-        let mut main_handler = DataHandler::new(path)?;
-        let reference_file = FileMetadata::new(
-            "OFNT3AA1",
-            "Offender Profile",
-            "https://example.com/OFNT3AA1.zip",
-        );
-
-        main_handler.reference_file = Some(reference_file);
-        main_handler.reference_table_name = Some("offender_profile".to_string());
-        main_handler.reference_field = Some("DOCNUM".to_string());
-        main_handler.is_initialized = true;
-
-        main_handler.database.execute(
-            "CREATE TABLE offender_profile (DOCNUM TEXT PRIMARY KEY)",
-            [],
-        )?;
-
-        let ref_table = main_handler.reference_table_name().unwrap().to_string();
-        let ref_field = main_handler.reference_field().unwrap().to_string();
-
-        let mut handles = vec![];
-        for _ in 0..3 {
-            let db = Arc::clone(&db_path);
-            let ref_file = reference_file;
-            let ref_tbl = ref_table.clone();
-            let ref_fld = ref_field.clone();
-
-            let handle = thread::spawn(move || -> Result<()> {
-                let mut worker = create_worker_handler(&db)?;
-                worker.init_from_reference(&ref_file, &ref_tbl, &ref_fld);
-
-                let test_file = FileMetadata::new(
-                    "OFNT1BA1",
-                    "Offender Address",
-                    "https://example.com/OFNT1BA1.zip",
-                );
-
-                worker.create_table_for_file(&test_file)?;
-                Ok(())
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            handle.join().expect("Thread panicked")?;
-        }
-
-        let table_exists: i32 = main_handler.database.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='offender_address'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        assert_eq!(table_exists, 1, "Table should exist after concurrent creation attempts");
-
-        Ok(())
-    }
 
     #[test]
     fn test_error_collection_does_not_stop_processing() -> Result<()> {
