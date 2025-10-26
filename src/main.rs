@@ -8,7 +8,7 @@ use clap::Parser;
 use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use ncdac_opi_parser::{
-    concurrency::{create_worker_handler, ErrorAggregator},
+    concurrency::{create_worker_handler, DesFailureAggregator, ErrorAggregator},
     data_handler::DataHandler,
     download::{
         are_decompressed_files_valid, categorize_files, download_data_file, get_data_dir,
@@ -144,8 +144,8 @@ async fn main() -> Result<()> {
         .context("Failed to calculate total duration")?;
     println!("✅ Processing complete in {}", total_duration);
 
-    if let Some(missing_des_report) = data_handler.report_missing_des_files() {
-        eprintln!("\n{}", missing_des_report);
+    if let Some(des_failures_report) = data_handler.report_des_file_failures() {
+        eprintln!("\n{}", des_failures_report);
     }
 
     if !data_handler.errors.is_empty() {
@@ -599,6 +599,7 @@ async fn run(
     ));
 
     let error_aggregator = Arc::new(ErrorAggregator::new());
+    let des_failure_aggregator = Arc::new(DesFailureAggregator::new());
 
     let database_path = args.output.to_str().context("Invalid output path")?;
     let parallel_start_time = SystemTime::now();
@@ -625,6 +626,7 @@ async fn run(
 
         let pb = Arc::clone(&combined_pb);
         let agg = Arc::clone(&error_aggregator);
+        let des_agg = Arc::clone(&des_failure_aggregator);
 
         match worker_handler.process_file(file, Some(&pb)) {
             Ok(Some(results)) => {
@@ -633,7 +635,9 @@ async fn run(
                 }
             }
             Ok(None) => {
-                // File was already processed (shouldn't happen in parallel context)
+                if !worker_handler.des_file_failures.is_empty() {
+                    des_agg.add_failures(worker_handler.des_file_failures.clone());
+                }
             }
             Err(e) => {
                 eprintln!("❌ Failed to process file {}: {:#}", file.id, e);
@@ -655,6 +659,9 @@ async fn run(
 
     let all_parallel_errors = error_aggregator.get_errors();
     data_handler.errors.extend(all_parallel_errors);
+
+    let all_des_failures = des_failure_aggregator.get_failures();
+    data_handler.des_file_failures.extend(all_des_failures);
 
     if !args.keep_data {
         let spinner = create_spinner("Cleaning up data files...");

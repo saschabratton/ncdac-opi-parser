@@ -144,8 +144,8 @@ pub struct DataHandler {
     processed_files: HashSet<String>,
     /// Collection of all errors encountered during processing
     pub errors: Vec<ErrorDetails>,
-    /// Collection of file IDs for missing DES files
-    missing_des_files: Vec<String>,
+    /// Collection of file IDs that failed due to missing or invalid DES files
+    pub des_file_failures: Vec<String>,
 }
 
 impl DataHandler {
@@ -201,7 +201,7 @@ impl DataHandler {
             is_initialized: false,
             processed_files: HashSet::new(),
             errors: Vec::new(),
-            missing_des_files: Vec::new(),
+            des_file_failures: Vec::new(),
         })
     }
 
@@ -304,7 +304,7 @@ impl DataHandler {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn create_table_for_file(&self, file: &FileMetadata) -> Result<String> {
+    pub fn create_table_for_file(&self, file: &FileMetadata) -> Result<(String, FileDescription)> {
         let table_name = to_snake_case(file.name);
         let description = FileDescription::new(file.id)?;
 
@@ -354,49 +354,23 @@ impl DataHandler {
             .execute(&sql, [])
             .with_context(|| format!("Failed to create table {}", table_name))?;
 
-        Ok(table_name)
+        Ok((table_name, description))
     }
 
-    /// Inserts column descriptions from a DES file into the column_descriptions table.
+    /// Inserts column descriptions from a FileDescription schema into the column_descriptions table.
     ///
-    /// Reads the DES file for the given file, extracts column names and descriptions,
-    /// and inserts them into the column_descriptions table.
+    /// Takes the pre-parsed schema and inserts column names and descriptions
+    /// into the column_descriptions table.
     ///
     /// # Arguments
     ///
-    /// * `file` - The file metadata for which to insert column descriptions
+    /// * `table_name` - The name of the table
+    /// * `description` - The FileDescription containing the schema with descriptions
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - The DES file exists but cannot be parsed
-    /// - The database insertion fails
-    ///
-    /// If the DES file is missing, the error is collected in `missing_des_files`
-    /// and this method returns Ok(()) to allow processing to continue.
-    pub fn insert_column_descriptions(&mut self, file: &FileMetadata) -> Result<()> {
-        let table_name = to_snake_case(file.name);
-
-        let data_dir = crate::utilities::data_directory();
-        let descriptor_path = data_dir.join(file.id).join(format!("{}.des", file.id));
-        let descriptor_content = match std::fs::read_to_string(&descriptor_path) {
-            Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.missing_des_files.push(file.id.to_string());
-                return Ok(());
-            }
-            Err(e) => return Err(e).with_context(|| format!("Failed to read DES file: {}", descriptor_path.display())),
-        };
-
-
-        use once_cell::sync::Lazy;
-        use regex::Regex;
-
-        static DES_LINE_REGEX: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"^(\S+)\s{2,}(.+?)\s{2,}([A-Z]+)\s+(\d+)\s+(\d+)")
-                .expect("Invalid DES line regex pattern")
-        });
-
+    /// Returns an error if the database insertion fails.
+    pub fn insert_column_descriptions(&mut self, table_name: &str, description: &FileDescription) -> Result<()> {
         let tx = self.database.transaction()
             .context("Failed to begin transaction for column descriptions")?;
 
@@ -405,26 +379,11 @@ impl DataHandler {
                 "INSERT INTO column_descriptions (table_name, column_name, description) VALUES (?, ?, ?)"
             ).context("Failed to prepare INSERT statement for column descriptions")?;
 
-            for line in descriptor_content.lines() {
-                let trimmed = line.trim_end();
-                if trimmed.trim().is_empty() {
-                    continue;
-                }
-
-                if let Some(captures) = DES_LINE_REGEX.captures(trimmed) {
-                    let column_name = captures.get(1)
-                        .expect("Column name capture group")
-                        .as_str();
-                    let description = captures.get(2)
-                        .expect("Description capture group")
-                        .as_str()
-                        .trim();
-
-                    stmt.execute([&table_name, column_name, description])
-                        .with_context(|| {
-                            format!("Failed to insert description for {}.{}", table_name, column_name)
-                        })?;
-                }
+            for (column_name, field_def) in &description.schema {
+                stmt.execute([table_name, column_name.as_str(), field_def.description.as_str()])
+                    .with_context(|| {
+                        format!("Failed to insert description for {}.{}", table_name, column_name)
+                    })?;
             }
         }
 
@@ -671,8 +630,23 @@ impl DataHandler {
             return Ok(None);
         }
 
-        self.create_table_for_file(file)?;
-        self.insert_column_descriptions(file)?;
+        // Try to create the table and get the description
+        let (table_name, description) = match self.create_table_for_file(file) {
+            Ok(result) => result,
+            Err(e) => {
+                // Check if this is a DES file error (file not found or parse error)
+                let error_msg = format!("{:#}", e);
+                if error_msg.contains("Failed to read DES file") || error_msg.contains("DES file") {
+                    // Collect DES file failure and return Ok(None) to continue processing other files
+                    self.des_file_failures.push(file.id.to_string());
+                    return Ok(None);
+                }
+                // For other errors, propagate them
+                return Err(e);
+            }
+        };
+
+        self.insert_column_descriptions(&table_name, &description)?;
         let results = self.insert_records_for_file(file, pb)?;
 
         self.processed_files.insert(file.id.to_string());
@@ -770,20 +744,21 @@ impl DataHandler {
         self.is_initialized = true;
     }
 
-    /// Returns a formatted message listing all missing DES files.
+    /// Returns a formatted warning message for files that failed due to missing or invalid DES files.
     ///
-    /// Returns None if no DES files are missing.
-    pub fn report_missing_des_files(&self) -> Option<String> {
-        if self.missing_des_files.is_empty() {
+    /// Returns None if no DES file failures occurred.
+    pub fn report_des_file_failures(&self) -> Option<String> {
+        if self.des_file_failures.is_empty() {
             return None;
         }
 
-        let file_list = self.missing_des_files.join(", ");
+        let file_list = self.des_file_failures.join(", ");
         Some(format!(
-            "⚠️  Missing DES files for the following file IDs: {}\n   Column descriptions were not inserted for these files.",
+            "⚠️  The following files were skipped due to missing or invalid DES files: {}\n   Tables were not created for these files.",
             file_list
         ))
     }
+
 }
 
 /// Maps a DES field type to a SQLite type.
@@ -926,46 +901,35 @@ mod tests {
         Ok(())
     }
 
+
     #[test]
-    fn test_missing_des_files_initialization() -> Result<()> {
+    fn test_des_file_failures_reporting_empty() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path().to_str().unwrap();
 
         let handler = DataHandler::new(path)?;
 
-        assert_eq!(handler.missing_des_files.len(), 0, "missing_des_files should be empty on initialization");
+        assert!(handler.report_des_file_failures().is_none(), "Should return None when no DES file failures");
 
         Ok(())
     }
 
     #[test]
-    fn test_report_missing_des_files_empty() -> Result<()> {
-        let temp_file = NamedTempFile::new()?;
-        let path = temp_file.path().to_str().unwrap();
-
-        let handler = DataHandler::new(path)?;
-
-        assert!(handler.report_missing_des_files().is_none(), "Should return None when no missing DES files");
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_report_missing_des_files_with_entries() -> Result<()> {
+    fn test_des_file_failures_reporting_with_failures() -> Result<()> {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path().to_str().unwrap();
 
         let mut handler = DataHandler::new(path)?;
-        handler.missing_des_files.push("FILE1".to_string());
-        handler.missing_des_files.push("FILE2".to_string());
+        handler.des_file_failures.push("FILE1".to_string());
+        handler.des_file_failures.push("FILE2".to_string());
 
-        let report = handler.report_missing_des_files();
-        assert!(report.is_some(), "Should return Some when missing DES files exist");
+        let report = handler.report_des_file_failures();
+        assert!(report.is_some(), "Should return Some when DES file failures exist");
 
         let report_text = report.unwrap();
         assert!(report_text.contains("FILE1"), "Report should contain FILE1");
         assert!(report_text.contains("FILE2"), "Report should contain FILE2");
-        assert!(report_text.contains("Missing DES files"), "Report should contain warning message");
+        assert!(report_text.contains("missing or invalid DES files"), "Report should contain warning message");
 
         Ok(())
     }

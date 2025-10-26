@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// Represents a field definition from a DES descriptor file.
 ///
 /// Each field has a type (CHAR, DECIMAL, DATE, TIME), a start position (1-indexed),
-/// and a length in characters.
+/// a length in characters, and a human-readable description.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldDefinition {
     /// The field type (e.g., "CHAR", "DECIMAL", "DATE", "TIME")
@@ -17,6 +17,8 @@ pub struct FieldDefinition {
     pub start: usize,
     /// The length of the field in characters
     pub length: usize,
+    /// The human-readable description of the field
+    pub description: String,
 }
 
 impl FieldDefinition {
@@ -27,11 +29,13 @@ impl FieldDefinition {
     /// * `field_type` - The type of the field
     /// * `start` - The 1-indexed start position
     /// * `length` - The length of the field
-    pub fn new(field_type: String, start: usize, length: usize) -> Self {
+    /// * `description` - The human-readable description of the field
+    pub fn new(field_type: String, start: usize, length: usize, description: String) -> Self {
         Self {
             field_type,
             start,
             length,
+            description,
         }
     }
 
@@ -184,6 +188,12 @@ impl FileDescription {
                     .as_str()
                     .to_string();
 
+                let description = captures.get(2)
+                    .expect("Description capture group")
+                    .as_str()
+                    .trim()
+                    .to_string();
+
                 let field_type = captures.get(3)
                     .expect("Field type capture group")
                     .as_str()
@@ -208,7 +218,7 @@ impl FileDescription {
 
                 schema.insert(
                     field_code,
-                    FieldDefinition::new(field_type, start, length),
+                    FieldDefinition::new(field_type, start, length, description),
                 );
             }
         }
@@ -269,17 +279,18 @@ mod tests {
 
     #[test]
     fn test_field_definition_basic() {
-        let field = FieldDefinition::new("CHAR".to_string(), 1, 7);
+        let field = FieldDefinition::new("CHAR".to_string(), 1, 7, "Test description".to_string());
         assert_eq!(field.field_type, "CHAR");
         assert_eq!(field.start, 1);
         assert_eq!(field.length, 7);
+        assert_eq!(field.description, "Test description");
         assert_eq!(field.end(), 7);
         assert_eq!(field.zero_indexed_start(), 0);
     }
 
     #[test]
     fn test_field_definition_end_calculation() {
-        let field = FieldDefinition::new("CHAR".to_string(), 8, 2);
+        let field = FieldDefinition::new("CHAR".to_string(), 8, 2, "Another description".to_string());
         assert_eq!(field.end(), 9);
         assert_eq!(field.zero_indexed_start(), 7);
     }
@@ -298,11 +309,13 @@ CPPAYSEQ      COP ACCOUNT SEQUENCE NUMBER        CHAR      10      3     "#;
         assert_eq!(cmdornum.field_type, "CHAR");
         assert_eq!(cmdornum.start, 1);
         assert_eq!(cmdornum.length, 7);
+        assert_eq!(cmdornum.description, "OFFENDER NC DOC ID NUMBER");
 
         let cpprefix = schema.get("CPPREFIX").unwrap();
         assert_eq!(cpprefix.field_type, "CHAR");
         assert_eq!(cpprefix.start, 8);
         assert_eq!(cpprefix.length, 2);
+        assert_eq!(cpprefix.description, "COP COMMITMENT PREFIX");
     }
 
     #[test]

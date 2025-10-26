@@ -35,6 +35,62 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
 
+/// Thread-safe aggregator for collecting DES file failures from concurrent operations.
+///
+/// Similar to ErrorAggregator but specifically for tracking file IDs that failed
+/// due to missing or invalid DES files during parallel processing.
+#[derive(Debug, Clone)]
+pub struct DesFailureAggregator {
+    failures: Arc<Mutex<Vec<String>>>,
+}
+
+impl DesFailureAggregator {
+    /// Creates a new empty DesFailureAggregator.
+    pub fn new() -> Self {
+        Self {
+            failures: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Adds a file ID to the failure list in a thread-safe manner.
+    pub fn add_failure(&self, file_id: String) {
+        self.failures
+            .lock()
+            .expect("DES failure aggregator mutex poisoned")
+            .push(file_id);
+    }
+
+    /// Adds multiple file IDs to the failure list in a thread-safe manner.
+    pub fn add_failures(&self, file_ids: Vec<String>) {
+        self.failures
+            .lock()
+            .expect("DES failure aggregator mutex poisoned")
+            .extend(file_ids);
+    }
+
+    /// Extracts all collected failure IDs from the aggregator.
+    pub fn get_failures(&self) -> Vec<String> {
+        self.failures
+            .lock()
+            .expect("DES failure aggregator mutex poisoned")
+            .clone()
+    }
+
+    /// Returns the count of failures currently in the aggregator.
+    pub fn count(&self) -> usize {
+        self.failures
+            .lock()
+            .expect("DES failure aggregator mutex poisoned")
+            .len()
+    }
+}
+
+impl Default for DesFailureAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Thread-safe error aggregator for collecting errors from concurrent operations.
 ///
 /// This structure wraps a vector of ErrorDetails in an Arc<Mutex<T>> to allow
