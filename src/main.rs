@@ -9,7 +9,10 @@ use dialoguer::{theme::ColorfulTheme, Confirm, MultiSelect, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use ncdac_opi_parser::{
     data_handler::DataHandler,
-    download::{categorize_files, download_data_file, get_data_dir, get_file_status, FileStatus},
+    download::{
+        are_decompressed_files_valid, categorize_files, download_data_file, get_data_dir,
+        get_file_status, FileStatus,
+    },
     files::{get_file_by_id, FILES},
     unzip::unzip_data_file,
     utilities::{count_lines, delete_data_subdirectory, format_count, format_duration},
@@ -226,6 +229,35 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
     let file_status = categorize_files(&FILES, &data_dir);
     spinner.finish_and_clear();
 
+    if !file_status.unverifiable.is_empty() {
+        println!("\n⚠️  The following files have decompressed data but the ZIP file is missing:");
+        println!("    Data cannot be verified for integrity.");
+        for file_id in &file_status.unverifiable {
+            let file = get_file_by_id(file_id).unwrap();
+            println!("   - {} ({})", file.id, file.name);
+        }
+
+        println!("\nWould you like to:");
+        println!("  [d] Download ZIP files to verify data integrity");
+        println!("  [c] Continue without verification (default)");
+        print!("\nYour choice (d/c) [c]: ");
+        io::stdout().flush()?;
+
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let choice = input.trim().to_lowercase();
+
+        if choice == "d" {
+            println!("\n📥 Downloading ZIP files for verification...\n");
+            for file_id in &file_status.unverifiable {
+                let file = get_file_by_id(file_id).unwrap();
+                download_with_retry(file, &data_dir, false)?;
+            }
+        } else {
+            println!("Continuing without verification.");
+        }
+    }
+
     let mut all_problematic: Vec<String> = file_status.missing.clone();
     all_problematic.extend(file_status.incomplete.clone());
 
@@ -332,7 +364,7 @@ fn handle_downloads(reference_file: &ncdac_opi_parser::files::FileMetadata) -> R
                     }
                 }
                 _ => {
-                    println!("\n📥 Downloading all missing, incomplete, or out-of-date files...\n");
+                    println!("\n📥 Downloading all missing/out-of-date files...\n");
                     for file_id in &other_problematic {
                         let file = get_file_by_id(file_id).unwrap();
                         download_with_retry(file, &data_dir, false)?;
@@ -362,7 +394,7 @@ async fn run(
     let data_dir = get_data_dir();
 
     for file in &FILES {
-        if ncdac_opi_parser::download::decompressed_files_exist(file, &data_dir) {
+        if are_decompressed_files_valid(file, &data_dir) {
             already_decompressed.push(file.id);
             continue;
         }
@@ -377,7 +409,7 @@ async fn run(
                 continue;
             }
             FileStatus::Complete => {
-                // File is valid, proceed to decompress
+                // ZIP is valid, proceed to decompress (or re-decompress if needed)
             }
         }
 
@@ -414,24 +446,12 @@ async fn run(
         }
     }
 
-    if !already_decompressed.is_empty() {
-        if decompress_count == 0 && missing_files.is_empty() {
-            spinner.finish_and_clear();
-        }
-        for file_id in &already_decompressed {
-            println!(
-                "\x1b[34mℹ\x1b[0m Skipped {} (already decompressed)",
-                file_id
-            );
-        }
-    }
-
     if decompress_count == 0 && missing_files.is_empty() && already_decompressed.is_empty() {
         spinner.finish_with_message("No files to decompress".to_string());
-    } else if decompress_count > 0 || !missing_files.is_empty() || !already_decompressed.is_empty() {
-        if decompress_count > 0 {
-            println!();
-        }
+    } else if decompress_count > 0 {
+        println!();
+    } else {
+        spinner.finish_and_clear();
     }
 
     let mut data_handler = DataHandler::new(

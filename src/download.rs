@@ -7,6 +7,7 @@ use crate::files::FileMetadata;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::blocking::Client;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -133,12 +134,23 @@ pub fn download_db_structure_pdf(data_dir: &Path) -> Result<()> {
 fn get_remote_file_size(url: &str) -> Option<u64> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .ok()?;
 
     let response = client.head(url).send().ok()?;
 
-    response.content_length()
+    // Manually parse Content-Length header instead of using response.content_length()
+    // because reqwest sometimes returns 0 even when the header is present
+    if let Some(content_length_header) = response.headers().get("content-length") {
+        if let Ok(content_length_str) = content_length_header.to_str() {
+            if let Ok(size) = content_length_str.parse::<u64>() {
+                return Some(size);
+            }
+        }
+    }
+
+    None
 }
 
 /// File download status
@@ -218,6 +230,32 @@ pub fn get_data_dir() -> PathBuf {
     PathBuf::from("./data")
 }
 
+/// Get expected file sizes from a ZIP archive.
+///
+/// Opens the ZIP file and retrieves the uncompressed sizes of all entries.
+///
+/// # Arguments
+///
+/// * `zip_path` - Path to the ZIP file
+///
+/// # Returns
+///
+/// HashMap mapping file names to their expected uncompressed sizes, or None if the ZIP can't be read
+fn get_expected_sizes_from_zip(zip_path: &Path) -> Option<HashMap<String, u64>> {
+    let file = File::open(zip_path).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+
+    let mut sizes = HashMap::new();
+    for i in 0..archive.len() {
+        if let Ok(entry) = archive.by_index(i) {
+            let name = entry.name().to_string();
+            sizes.insert(name, entry.size());
+        }
+    }
+
+    Some(sizes)
+}
+
 /// Check if decompressed files (.des and .dat) exist.
 ///
 /// This is a fast check that only verifies file existence, not integrity.
@@ -241,7 +279,8 @@ pub fn decompressed_files_exist(file: &FileMetadata, data_dir: &Path) -> bool {
 
 /// Check if decompressed files (.des and .dat) are valid.
 ///
-/// Checks if both .des and .dat files exist.
+/// Validates that both .des and .dat files exist and have the correct sizes
+/// by comparing against the expected sizes from the ZIP archive.
 ///
 /// # Arguments
 ///
@@ -250,9 +289,49 @@ pub fn decompressed_files_exist(file: &FileMetadata, data_dir: &Path) -> bool {
 ///
 /// # Returns
 ///
-/// `true` if both .des and .dat files exist, `false` otherwise
-pub fn are_decompressed_files_valid(file: &FileMetadata, data_dir: &Path) -> bool {
-    decompressed_files_exist(file, data_dir)
+/// `true` if both .des and .dat files exist and have correct sizes, `false` otherwise
+pub fn  (file: &FileMetadata, data_dir: &Path) -> bool {
+    if !decompressed_files_exist(file, data_dir) {
+        return false;
+    }
+
+    let file_dir = data_dir.join(file.id);
+    let des_path = file_dir.join(format!("{}.des", file.id));
+    let dat_path = file_dir.join(format!("{}.dat", file.id));
+
+    let zip_path = data_dir.join(format!("{}.zip", file.id));
+    let expected_sizes = match get_expected_sizes_from_zip(&zip_path) {
+        Some(sizes) => sizes,
+        None => {
+            // If we can't read the ZIP, assume decompressed files are valid
+            // This handles cases where ZIP was deleted after extraction
+            return true;
+        }
+    };
+
+    let des_filename = format!("{}.des", file.id);
+    if let Some(&expected_des_size) = expected_sizes.get(&des_filename) {
+        if let Ok(metadata) = fs::metadata(&des_path) {
+            if metadata.len() != expected_des_size {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    let dat_filename = format!("{}.dat", file.id);
+    if let Some(&expected_dat_size) = expected_sizes.get(&dat_filename) {
+        if let Ok(metadata) = fs::metadata(&dat_path) {
+            if metadata.len() != expected_dat_size {
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Categorization of files by their download status
@@ -262,15 +341,19 @@ pub struct FilesStatus {
     pub missing: Vec<String>,
     /// Files that exist but have incorrect size
     pub incomplete: Vec<String>,
+    /// Decompressed files exist but ZIP is missing (can't verify)
+    pub unverifiable: Vec<String>,
 }
 
 /// Categorize files by their download status.
 ///
 /// Checks in this order:
-/// 1. If decompressed files (.des and .dat) exist, file is considered available
-/// 2. If ZIP file exists and has correct size, file is considered available
-/// 3. If ZIP file exists but has wrong size, file is considered incomplete
-/// 4. Otherwise, file is considered missing
+/// 1. If decompressed files (.des and .dat) exist and are valid against ZIP, file is considered available
+/// 2. If decompressed files exist but ZIP is missing, file is marked as unverifiable
+/// 3. If decompressed files are invalid or don't exist, check ZIP file:
+///    - If ZIP exists and has correct size (via HTTP HEAD), file will be re-decompressed
+///    - If ZIP exists but has wrong size, file is marked as incomplete (needs re-download)
+///    - If ZIP doesn't exist, file is marked as missing (needs download)
 ///
 /// # Arguments
 ///
@@ -279,16 +362,24 @@ pub struct FilesStatus {
 ///
 /// # Returns
 ///
-/// `FilesStatus` containing vectors of missing and incomplete file IDs
+/// `FilesStatus` containing vectors of missing, incomplete, and unverifiable file IDs
 pub fn categorize_files(files: &[FileMetadata], data_dir: &Path) -> FilesStatus {
     let mut status = FilesStatus::default();
 
     for file in files {
-        if decompressed_files_exist(file, data_dir) {
+        let des_dat_exist = decompressed_files_exist(file, data_dir);
+        let zip_status = get_file_status(file, data_dir);
+
+        if des_dat_exist && zip_status == FileStatus::Missing {
+            status.unverifiable.push(file.id.to_string());
             continue;
         }
 
-        match get_file_status(file, data_dir) {
+        if are_decompressed_files_valid(file, data_dir) {
+            continue;
+        }
+
+        match zip_status {
             FileStatus::Complete => {
             }
             FileStatus::Incomplete => {
