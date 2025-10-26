@@ -814,9 +814,6 @@ mod tests {
             "OFNT3AA1",
             "Offender Profile",
             "https://example.com/OFNT3AA1.zip",
-            None,
-            None,
-            None,
         );
 
         let _ = handler.init(&reference_file, None);
@@ -846,9 +843,6 @@ mod tests {
             "OFNT3AA1",
             "Offender Profile",
             "https://example.com/OFNT3AA1.zip",
-            None,
-            None,
-            None,
         );
 
         let _ = handler.init(&reference_file, None);
@@ -872,9 +866,6 @@ mod tests {
             "OFNT1BA1",
             "Offender Address",
             "https://example.com/OFNT1BA1.zip",
-            None,
-            None,
-            None,
         );
 
         let result = handler.process_file(&other_file, None);
@@ -900,9 +891,6 @@ mod tests {
             "OFNT3AA1",
             "Offender Profile",
             "https://example.com/OFNT3AA1.zip",
-            None,
-            None,
-            None,
         );
 
         let _ = handler.init(&reference_file, None);
@@ -950,9 +938,6 @@ mod tests {
             "OFNT3AA1",
             "Offender Profile",
             "https://example.com/OFNT3AA1.zip",
-            None,
-            None,
-            None,
         );
 
         main_handler.reference_file = Some(reference_file);
@@ -983,9 +968,6 @@ mod tests {
                     "OFNT1BA1",
                     "Offender Address",
                     "https://example.com/OFNT1BA1.zip",
-                    None,
-                    None,
-                    None,
                 );
 
                 worker.create_table_for_file(&test_file)?;
@@ -1039,9 +1021,6 @@ mod tests {
             "TEST",
             "Test Table",
             "https://example.com/TEST.zip",
-            None,
-            None,
-            None,
         );
 
         let batch = vec![
@@ -1078,9 +1057,6 @@ mod tests {
             "OFNT3AA1",
             "Offender Profile",
             "https://example.com/OFNT3AA1.zip",
-            None,
-            None,
-            None,
         );
 
         worker_handler.init_from_reference(&reference_file, "offender_profile", "DOCNUM");
@@ -1165,7 +1141,7 @@ mod tests {
         let temp_file = NamedTempFile::new()?;
         let path = temp_file.path().to_str().unwrap();
 
-        let mut main_handler = DataHandler::new(path)?;
+        let main_handler = DataHandler::new(path)?;
         main_handler.database.execute(
             "CREATE TABLE ref_table (id TEXT PRIMARY KEY)",
             [],
@@ -1216,9 +1192,6 @@ mod tests {
             "TEST",
             "Test Table",
             "https://example.com/TEST.zip",
-            None,
-            None,
-            None,
         );
 
         handler.processed_files.insert("TEST".to_string());
@@ -1245,9 +1218,6 @@ mod tests {
             "OFNT3AA1",
             "Offender Profile",
             "https://example.com/OFNT3AA1.zip",
-            None,
-            None,
-            None,
         );
 
         worker1.init_from_reference(&ref_file, "offender_profile", "DOCNUM");

@@ -15,7 +15,7 @@ use ncdac_opi_parser::{
         get_file_status, FileStatus,
     },
     files::{get_file_by_id, FILES},
-    unzip::unzip_data_file,
+    unzip::{calculate_total_uncompressed_bytes, decompress_with_shared_progress},
     utilities::{count_lines, delete_data_subdirectory, format_count, format_duration},
 };
 use rayon::prelude::*;
@@ -387,14 +387,12 @@ async fn run(
     args: &Cli,
     reference_file: &ncdac_opi_parser::files::FileMetadata,
 ) -> Result<DataHandler> {
-    let spinner = create_spinner("Decompressing data files...");
+    let data_dir = get_data_dir();
 
-    let mut decompress_count = 0;
     let mut already_decompressed = Vec::new();
     let mut missing_files = Vec::new();
     let mut incomplete_files = Vec::new();
-
-    let data_dir = get_data_dir();
+    let mut files_to_decompress = Vec::new();
 
     for file in &FILES {
         if are_decompressed_files_valid(file, &data_dir) {
@@ -412,49 +410,88 @@ async fn run(
                 continue;
             }
             FileStatus::Complete => {
-                // ZIP is valid, proceed to decompress (or re-decompress if needed)
+                files_to_decompress.push(*file);
             }
         }
+    }
 
-        if decompress_count == 0 {
-            spinner.finish_and_clear();
+    if files_to_decompress.is_empty() {
+        if !missing_files.is_empty() || !incomplete_files.is_empty() {
+            for file_id in &missing_files {
+                println!(
+                    "\x1b[34mℹ\x1b[0m Skipped {} (ZIP file not available)",
+                    file_id
+                );
+            }
+            for file_id in &incomplete_files {
+                println!(
+                    "\x1b[33m⚠\x1b[0m Skipped {} (ZIP file out-of-date or incomplete)",
+                    file_id
+                );
+            }
         }
+    } else {
+        let total_bytes = calculate_total_uncompressed_bytes(&files_to_decompress, &data_dir)
+            .context("Failed to calculate total uncompressed bytes")?;
 
-        match unzip_data_file(file.id, file.name) {
+        let total_mb = total_bytes as f64 / 1_048_576.0;
+
+        let shared_pb = Arc::new(ProgressBar::new(total_bytes));
+        shared_pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{msg}\n{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+        shared_pb.set_message(format!(
+            "Decompressing {} files concurrently - {:.1} MB total",
+            files_to_decompress.len(),
+            total_mb
+        ));
+
+        let decompression_start = SystemTime::now();
+
+        let result: Result<()> = files_to_decompress
+            .par_iter()
+            .try_for_each(|file| {
+                decompress_with_shared_progress(file.id, file.name, &shared_pb)?;
+                Ok(())
+            });
+
+        match result {
             Ok(_) => {
-                decompress_count += 1;
+                let decompression_duration = format_duration(decompression_start, None)
+                    .context("Failed to calculate decompression duration")?;
+
+                shared_pb.finish_with_message(format!(
+                    "✓ Decompressed {} files - {:.1} MB total in {}",
+                    files_to_decompress.len(),
+                    total_mb,
+                    decompression_duration
+                ));
+                println!();
             }
             Err(e) => {
-                eprintln!("❌ Failed to decompress {}: {}", file.id, e);
+                shared_pb.finish_and_clear();
+                eprintln!("❌ Failed to decompress files");
                 return Err(e);
             }
         }
-    }
 
-    if !missing_files.is_empty() || !incomplete_files.is_empty() {
-        if decompress_count == 0 {
-            spinner.finish_and_clear();
+        if !missing_files.is_empty() || !incomplete_files.is_empty() {
+            for file_id in &missing_files {
+                println!(
+                    "\x1b[34mℹ\x1b[0m Skipped {} (ZIP file not available)",
+                    file_id
+                );
+            }
+            for file_id in &incomplete_files {
+                println!(
+                    "\x1b[33m⚠\x1b[0m Skipped {} (ZIP file out-of-date or incomplete)",
+                    file_id
+                );
+            }
         }
-        for file_id in &missing_files {
-            println!(
-                "\x1b[34mℹ\x1b[0m Skipped {} (ZIP file not available)",
-                file_id
-            );
-        }
-        for file_id in &incomplete_files {
-            println!(
-                "\x1b[33m⚠\x1b[0m Skipped {} (ZIP file out-of-date or incomplete)",
-                file_id
-            );
-        }
-    }
-
-    if decompress_count == 0 && missing_files.is_empty() && already_decompressed.is_empty() {
-        spinner.finish_with_message("No files to decompress".to_string());
-    } else if decompress_count > 0 {
-        println!();
-    } else {
-        spinner.finish_and_clear();
     }
 
     let mut data_handler = DataHandler::new(
@@ -477,7 +514,6 @@ async fn run(
             .unwrap()
             .progress_chars("#>-"),
     );
-    // Task 2.4: Clear progress indication for reference file
     ref_pb.set_message(format!(
         "Processing reference file ({}) - Inserting {} records into {} table",
         reference_file.id,
@@ -509,11 +545,8 @@ async fn run(
         ));
     }
 
-    // Task 3.8: Log processing phase transition
     println!("\n📋 Reference file processing complete");
 
-    // Task 3.3: Calculate total record count for combined progress bar
-    // Filter files to process in parallel (exclude reference file and missing files)
     let files_to_process: Vec<_> = FILES
         .iter()
         .filter(|file| {
@@ -526,7 +559,6 @@ async fn run(
         .collect();
 
     if files_to_process.is_empty() {
-        // No additional files to process
         if !args.keep_data {
             let spinner = create_spinner("Cleaning up data files...");
             for file in &FILES {
@@ -539,7 +571,6 @@ async fn run(
         return Ok(data_handler);
     }
 
-    // Count total records across all files to process
     let mut total_records = 0u64;
     for file in &files_to_process {
         let dat_path = data_dir.join(file.id).join(format!("{}.dat", file.id));
@@ -548,10 +579,8 @@ async fn run(
         }
     }
 
-    // Task 3.8: Log processing phase transition
     println!("🚀 Starting parallel processing of {} files", files_to_process.len());
 
-    // Task 3.4: Create shared progress bar with Arc wrapping
     let combined_pb = Arc::new(ProgressBar::new(total_records));
     combined_pb.set_style(
         ProgressStyle::default_bar()
@@ -565,14 +594,11 @@ async fn run(
         format_count(total_records as usize)
     ));
 
-    // Task 3.7: Aggregate errors from all parallel workers
     let error_aggregator = Arc::new(ErrorAggregator::new());
 
     let database_path = args.output.to_str().context("Invalid output path")?;
     let parallel_start_time = SystemTime::now();
 
-    // Extract reference metadata before parallel processing
-    // (data_handler cannot be borrowed across threads)
     let ref_file = data_handler.reference_file().copied()
         .context("Reference file not set before parallel processing")?;
     let ref_table = data_handler.reference_table_name()
@@ -582,10 +608,7 @@ async fn run(
         .context("Reference field not set before parallel processing")?
         .to_string();
 
-    // Task 3.5: Convert sequential file loop to Rayon parallel iterator
-    // Task 3.6: Implement per-thread file processing with error collection
     files_to_process.par_iter().for_each(|file| {
-        // Task 3.2: Each thread creates its own DataHandler instance with separate connection
         let mut worker_handler = match create_worker_handler(database_path) {
             Ok(handler) => handler,
             Err(e) => {
@@ -594,18 +617,13 @@ async fn run(
             }
         };
 
-        // Initialize the worker handler with the same reference file metadata
-        // This sets up the reference table name and field for foreign key constraints
         worker_handler.init_from_reference(&ref_file, &ref_table, &ref_field);
 
-        // Clone the progress bar for this thread
         let pb = Arc::clone(&combined_pb);
         let agg = Arc::clone(&error_aggregator);
 
-        // Process the file with the worker's own connection
         match worker_handler.process_file(file, Some(&pb)) {
             Ok(Some(results)) => {
-                // Collect errors from this file into the shared aggregator
                 if !results.errors.is_empty() {
                     agg.add_errors(results.errors);
                 }
@@ -629,10 +647,8 @@ async fn run(
         format_count(total_records as usize)
     ));
 
-    // Task 3.8: Log processing phase transition
     println!("✅ Parallel processing complete");
 
-    // Task 3.7: Merge errors from parallel workers into main data handler
     let all_parallel_errors = error_aggregator.get_errors();
     data_handler.errors.extend(all_parallel_errors);
 
